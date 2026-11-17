@@ -11,6 +11,8 @@ Colab workflow
 2. Put this file in /content (upload it or use %%writefile assignment02.py).
 3. !python assignment02.py
    (optional env vars: CAME_EPOCHS, CAME_BATCH_SIZE, CAME_PER_CLASS, CAME_HF_MODE)
+   Defaults = best MLflow sweep run: epochs=25, batch_size=32, per_class=2000
+   (train 15300 / val 2700), extra_aug off, dropout=0.5, common val 150/class.
 4. main() trains, restores the best validation checkpoint, encodes it, verifies
    load_trained_model(cpu) and writes `assignment02_submission.py`: a copy of
    this file with TRAINED_MODEL_B64 already filled in. Download that file, rename
@@ -49,6 +51,14 @@ NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
 SEED = 42
 VAL_FRACTION = 0.15
+
+# Best hyperparameters from the MLflow sweep (used as defaults; env vars still override).
+DEFAULT_EPOCHS = 25
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_PER_CLASS = 2000
+DEFAULT_EXTRA_AUG = "0"
+DEFAULT_DROPOUT = 0.5
+DEFAULT_COMMON_VAL_PER_CLASS = 150
 
 HF_DATASET_ID = "1aurent/NCT-CRC-HE"
 HF_SPLIT = "NCT_CRC_HE_100K"
@@ -340,11 +350,11 @@ def build_datasets():
     # Colab path: Hugging Face 1aurent/NCT-CRC-HE, split NCT_CRC_HE_100K.
     # CAME_POOL_PER_CLASS (>= CAME_PER_CLASS) lets sweep runs share one cached pool
     # and nested validation sets even when CAME_PER_CLASS differs between runs.
-    per_class = int(os.environ.get("CAME_PER_CLASS", 1000))
+    per_class = int(os.environ.get("CAME_PER_CLASS", DEFAULT_PER_CLASS))
     pool_per_class = max(per_class, int(os.environ.get("CAME_POOL_PER_CLASS", per_class)))
     images, labels = _load_hf_subset(pool_per_class)
     train_idx, val_idx = _select_and_split(labels, per_class)
-    extra_aug = os.environ.get("CAME_EXTRA_AUG", "1") != "0"
+    extra_aug = os.environ.get("CAME_EXTRA_AUG", DEFAULT_EXTRA_AUG) != "0"
     train_dataset = NCTPatchDataset(images[train_idx], labels[train_idx],
                                     make_transforms(True), extra_aug=extra_aug)
     val_dataset = NCTPatchDataset(images[val_idx], labels[val_idx],
@@ -381,10 +391,10 @@ def build_model(num_classes: int = 9) -> torch.nn.Module:
     AdaptiveAvgPool2d, Flatten, Dropout, Linear). Returns raw logits (N, num_classes).
     Trainable parameters (num_classes=9): 437,481.
 
-    Dropout p is 0.3 unless CAME_DROPOUT is set (Colab sweeps only). Dropout has no
+    Dropout p is 0.5 (best sweep value) unless CAME_DROPOUT is set. Dropout has no
     weights and is inactive in eval mode, so it never affects loading or predictions.
     """
-    dropout_p = float(os.environ.get("CAME_DROPOUT", 0.3))
+    dropout_p = float(os.environ.get("CAME_DROPOUT", DEFAULT_DROPOUT))
     features = nn.Sequential(
         # Block 1: 3 -> 32, 64x64 -> 32x32
         nn.Sequential(*_conv_bn_relu(3, 32), *_conv_bn_relu(32, 32), nn.MaxPool2d(2, 2)),
@@ -694,11 +704,11 @@ def main():
     print("CUDA available:", torch.cuda.is_available(), "| Device:",
           torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
 
-    batch_size = int(os.environ.get("CAME_BATCH_SIZE", 64 if torch.cuda.is_available() else 32))
-    epochs = int(os.environ.get("CAME_EPOCHS", 12))
-    per_class = int(os.environ.get("CAME_PER_CLASS", 1000))
+    batch_size = int(os.environ.get("CAME_BATCH_SIZE", DEFAULT_BATCH_SIZE))
+    epochs = int(os.environ.get("CAME_EPOCHS", DEFAULT_EPOCHS))
+    per_class = int(os.environ.get("CAME_PER_CLASS", DEFAULT_PER_CLASS))
     pool_per_class = max(per_class, int(os.environ.get("CAME_POOL_PER_CLASS", per_class)))
-    common_n = int(os.environ.get("CAME_COMMON_VAL_PER_CLASS", 0))
+    common_n = int(os.environ.get("CAME_COMMON_VAL_PER_CLASS", DEFAULT_COMMON_VAL_PER_CLASS))
 
     train_dataset, val_dataset = build_datasets()
     train_loader, val_loader = make_loaders(train_dataset, val_dataset, batch_size)
@@ -709,9 +719,9 @@ def main():
         "per_class": per_class,
         "pool_per_class": pool_per_class,
         "common_val_per_class": common_n,
-        "dropout": float(os.environ.get("CAME_DROPOUT", 0.3)),
+        "dropout": float(os.environ.get("CAME_DROPOUT", DEFAULT_DROPOUT)),
         "hf_mode": os.environ.get("CAME_HF_MODE", "stream"),
-        "extra_aug": os.environ.get("CAME_EXTRA_AUG", "1") != "0",
+        "extra_aug": os.environ.get("CAME_EXTRA_AUG", DEFAULT_EXTRA_AUG) != "0",
         "train_size": len(train_dataset),
         "val_size": len(val_dataset),
         "optimizer": "AdamW",
