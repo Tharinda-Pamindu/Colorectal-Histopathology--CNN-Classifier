@@ -265,11 +265,11 @@ def _collect_full(per_class: int):
     return buckets
 
 
-def _load_hf_subset():
-    """Return (images uint8 (N,64,64,3), labels long (N,)) for a balanced subset, cached on disk."""
-    per_class = int(os.environ.get("CAME_PER_CLASS", 1000))
+def _load_hf_subset(pool_per_class: int):
+    """Return (images uint8 (N,64,64,3), labels long (N,)): a balanced pool of up to
+    `pool_per_class` patches per class, cached on disk."""
     mode = os.environ.get("CAME_HF_MODE", "stream").lower()
-    cache = Path(os.environ.get("CAME_CACHE", f"nct_crc_he_100k_subset_{per_class}.pt"))
+    cache = Path(os.environ.get("CAME_CACHE", f"nct_crc_he_100k_subset_{pool_per_class}.pt"))
 
     if cache.exists():
         print(f"[data] loading cached subset from {cache}")
@@ -277,9 +277,9 @@ def _load_hf_subset():
         return blob["images"], blob["labels"]
 
     if mode == "full":
-        buckets = _collect_full(per_class)
+        buckets = _collect_full(pool_per_class)
     else:
-        buckets = _collect_streaming(per_class)
+        buckets = _collect_streaming(pool_per_class)
 
     images, labels = [], []
     for c in range(NUM_CLASSES):
@@ -297,17 +297,36 @@ def _load_hf_subset():
     return images, labels
 
 
-def _stratified_split(labels: torch.Tensor, val_fraction: float = VAL_FRACTION, seed: int = SEED):
-    """Deterministic per-class 85 / 15 split. Returns (train_idx, val_idx) long tensors."""
+def _select_and_split(labels: torch.Tensor, per_class: int,
+                      val_fraction: float = VAL_FRACTION, seed: int = SEED):
+    """Deterministic balanced selection + per-class 85 / 15 split.
+
+    Each class's pool is shuffled once with `seed` (independent of `per_class`); the
+    first `per_class` items are used and the first 15 % of those are validation.
+    So runs with different `per_class` on the same pool have nested validation sets,
+    and the first round(0.15 * min_per_class) items of every class are validation
+    (never training) in every run -> a fair common set for comparing sweep runs.
+    Returns (train_idx, val_idx); val_idx is grouped by class in shuffled order.
+    """
     g = torch.Generator().manual_seed(seed)
     train_idx, val_idx = [], []
     for c in range(NUM_CLASSES):
         idx = (labels == c).nonzero(as_tuple=False).view(-1)
-        idx = idx[torch.randperm(idx.numel(), generator=g)]
+        idx = idx[torch.randperm(idx.numel(), generator=g)][:per_class]
         n_val = int(round(idx.numel() * val_fraction))
         val_idx.append(idx[:n_val])
         train_idx.append(idx[n_val:])
     return torch.cat(train_idx), torch.cat(val_idx)
+
+
+def _common_val_subset(val_dataset, n_per_class: int):
+    """First `n_per_class` validation items of every class (identical across sweep runs)."""
+    from torch.utils.data import Subset
+
+    keep = []
+    for c in range(NUM_CLASSES):
+        keep.extend((val_dataset.labels == c).nonzero(as_tuple=False).view(-1)[:n_per_class].tolist())
+    return Subset(val_dataset, keep)
 
 
 def build_datasets():
@@ -319,8 +338,12 @@ def build_datasets():
         return train_dataset, val_dataset
 
     # Colab path: Hugging Face 1aurent/NCT-CRC-HE, split NCT_CRC_HE_100K.
-    images, labels = _load_hf_subset()
-    train_idx, val_idx = _stratified_split(labels)
+    # CAME_POOL_PER_CLASS (>= CAME_PER_CLASS) lets sweep runs share one cached pool
+    # and nested validation sets even when CAME_PER_CLASS differs between runs.
+    per_class = int(os.environ.get("CAME_PER_CLASS", 1000))
+    pool_per_class = max(per_class, int(os.environ.get("CAME_POOL_PER_CLASS", per_class)))
+    images, labels = _load_hf_subset(pool_per_class)
+    train_idx, val_idx = _select_and_split(labels, per_class)
     extra_aug = os.environ.get("CAME_EXTRA_AUG", "1") != "0"
     train_dataset = NCTPatchDataset(images[train_idx], labels[train_idx],
                                     make_transforms(True), extra_aug=extra_aug)
@@ -357,7 +380,11 @@ def build_model(num_classes: int = 9) -> torch.nn.Module:
     Uses only allowed layers (Sequential, Conv2d, BatchNorm2d, ReLU, MaxPool2d,
     AdaptiveAvgPool2d, Flatten, Dropout, Linear). Returns raw logits (N, num_classes).
     Trainable parameters (num_classes=9): 437,481.
+
+    Dropout p is 0.3 unless CAME_DROPOUT is set (Colab sweeps only). Dropout has no
+    weights and is inactive in eval mode, so it never affects loading or predictions.
     """
+    dropout_p = float(os.environ.get("CAME_DROPOUT", 0.3))
     features = nn.Sequential(
         # Block 1: 3 -> 32, 64x64 -> 32x32
         nn.Sequential(*_conv_bn_relu(3, 32), *_conv_bn_relu(32, 32), nn.MaxPool2d(2, 2)),
@@ -371,7 +398,7 @@ def build_model(num_classes: int = 9) -> torch.nn.Module:
     classifier = nn.Sequential(
         nn.AdaptiveAvgPool2d(1),
         nn.Flatten(),
-        nn.Dropout(p=0.3),
+        nn.Dropout(p=dropout_p),
         nn.Linear(256, num_classes),
     )
     return nn.Sequential(features, classifier)
@@ -561,7 +588,7 @@ def _write_submission_file(b64: str, out_path: str = "assignment02_submission.py
 # MLflow experiment tracking (Colab only - never imported on CMS)
 # ===========================================================================
 MLFLOW_EXPERIMENT = os.environ.get("CAME_MLFLOW_EXPERIMENT", "came-a02-nct-crc-cnn")
-MLFLOW_RANK_METRIC = "best_val_macro_recall"
+MLFLOW_RANK_METRIC = os.environ.get("CAME_RANK_METRIC", "best_val_macro_recall")
 
 
 def _mlflow_start(params: dict):
@@ -578,7 +605,10 @@ def _mlflow_start(params: dict):
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
     run = mlflow.start_run(run_name=os.environ.get("CAME_RUN_NAME"))
     mlflow.log_params(params)
-    mlflow.set_tags({"task": "NCT-CRC-HE 9-class", "framework": "pytorch", "pretrained": "no"})
+    tags = {"task": "NCT-CRC-HE 9-class", "framework": "pytorch", "pretrained": "no"}
+    if os.environ.get("CAME_SWEEP_ID"):
+        tags["sweep_id"] = os.environ["CAME_SWEEP_ID"]
+    mlflow.set_tags(tags)
     print(f"[mlflow] run {run.info.run_id} in experiment '{MLFLOW_EXPERIMENT}' "
           f"({mlflow.get_tracking_uri()})")
     return mlflow
@@ -598,7 +628,7 @@ def _mlflow_epoch_callback(mlflow):
 
 
 def _mlflow_log_results(mlflow, report: dict, cpu_report: dict, history: list,
-                        train_seconds: float, artifacts: list) -> None:
+                        train_seconds: float, artifacts: list, extra_metrics=None) -> None:
     classes = official_classes()
     conf = report["confusion"]
     support = conf.sum(dim=1).clamp(min=1).double()
@@ -606,12 +636,13 @@ def _mlflow_log_results(mlflow, report: dict, cpu_report: dict, history: list,
 
     metrics = {
         "best_val_accuracy": report["accuracy"],
-        MLFLOW_RANK_METRIC: report["macro_recall"],
+        "best_val_macro_recall": report["macro_recall"],
         "cpu_fp16_val_accuracy": cpu_report["accuracy"],
         "cpu_fp16_val_macro_recall": cpu_report["macro_recall"],
         "train_seconds": train_seconds,
     }
     metrics.update({f"recall_{name}": r for name, r in zip(classes, per_class)})
+    metrics.update(extra_metrics or {})
     mlflow.log_metrics(metrics)
     mlflow.set_tag("cms_target_met", str(cpu_report["macro_recall"] >= 0.80))
 
@@ -640,8 +671,10 @@ def _mlflow_print_leaderboard(mlflow, top_k: int = 5) -> None:
     if runs is None or len(runs) == 0:
         return
     wanted = ["run_id", "tags.mlflow.runName", f"metrics.{MLFLOW_RANK_METRIC}",
-              "metrics.best_val_accuracy", "metrics.best_epoch",
-              "params.epochs", "params.per_class", "params.batch_size", "params.extra_aug"]
+              "metrics.common_val_macro_recall", "metrics.best_val_macro_recall",
+              "metrics.best_val_accuracy", "metrics.best_epoch", "params.epochs",
+              "params.per_class", "params.batch_size", "params.extra_aug", "params.dropout"]
+    wanted = list(dict.fromkeys(wanted))  # drop duplicates, keep order
     cols = [c for c in wanted if c in runs.columns]
     print(f"\n[mlflow] Top {len(runs)} runs by {MLFLOW_RANK_METRIC}:")
     print(runs[cols].to_string(index=False))
@@ -663,6 +696,9 @@ def main():
 
     batch_size = int(os.environ.get("CAME_BATCH_SIZE", 64 if torch.cuda.is_available() else 32))
     epochs = int(os.environ.get("CAME_EPOCHS", 12))
+    per_class = int(os.environ.get("CAME_PER_CLASS", 1000))
+    pool_per_class = max(per_class, int(os.environ.get("CAME_POOL_PER_CLASS", per_class)))
+    common_n = int(os.environ.get("CAME_COMMON_VAL_PER_CLASS", 0))
 
     train_dataset, val_dataset = build_datasets()
     train_loader, val_loader = make_loaders(train_dataset, val_dataset, batch_size)
@@ -670,7 +706,10 @@ def main():
     mlflow = _mlflow_start({
         "epochs": epochs,
         "batch_size": batch_size,
-        "per_class": int(os.environ.get("CAME_PER_CLASS", 1000)),
+        "per_class": per_class,
+        "pool_per_class": pool_per_class,
+        "common_val_per_class": common_n,
+        "dropout": float(os.environ.get("CAME_DROPOUT", 0.3)),
         "hf_mode": os.environ.get("CAME_HF_MODE", "stream"),
         "extra_aug": os.environ.get("CAME_EXTRA_AUG", "1") != "0",
         "train_size": len(train_dataset),
@@ -702,6 +741,21 @@ def main():
         print("Confusion matrix (rows=true, cols=pred):", official_classes())
         print(report["confusion"])
 
+        # Fixed common validation subset: identical for every sweep run -> fair ranking.
+        extra_metrics, common_report = {}, None
+        if common_n > 0 and hasattr(val_dataset, "labels"):
+            common_ds = _common_val_subset(val_dataset, common_n)
+            common_loader = DataLoader(common_ds, batch_size=batch_size, shuffle=False)
+            common_true = torch.cat([labels.long() for _, labels in common_loader])
+            common_report = classification_report(common_true, predict(model, common_loader, device))
+            extra_metrics = {
+                "common_val_accuracy": common_report["accuracy"],
+                "common_val_macro_recall": common_report["macro_recall"],
+            }
+            print(f"Common validation set ({common_n}/class, same for all sweep runs) | "
+                  f"accuracy={common_report['accuracy']:.4f} "
+                  f"macro_recall={common_report['macro_recall']:.4f}")
+
         torch.save(model.state_dict(), "best_model.pt")
         b64 = encode_model_to_b64(model)
         Path("trained_model_b64.txt").write_text(b64, encoding="ascii")
@@ -719,7 +773,7 @@ def main():
 
         if mlflow is not None:
             _mlflow_log_results(mlflow, report, cpu_report, history, train_seconds,
-                                ["best_model.pt", submission])
+                                ["best_model.pt", submission], extra_metrics)
             mlflow.end_run()
             _mlflow_print_leaderboard(mlflow)
 
@@ -729,6 +783,7 @@ def main():
             "history": history,
             "report": report,
             "cpu_report": cpu_report,
+            "common_report": common_report,
             "val_loader": val_loader,
             "submission": submission,
         }
